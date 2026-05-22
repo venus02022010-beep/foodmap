@@ -395,7 +395,7 @@
   <div id="cardsContainer" class="cards-grid">
     <div class="empty-message">✨ 還沒有攤位，新增第一間校園美食吧！</div>
   </div>
-  <footer>📌 點擊按鈕切換營業狀態 • 資料自動儲存於瀏覽器</footer>
+  <footer>📌 點擊按鈕切換營業狀態 • 資料自動儲存於瀏覽器 • 同步 Google Sheet</footer>
 </div>
 
 <script>
@@ -403,6 +403,7 @@
   let records = [];            // 所有美食攤位資料
   let currentFilter = "all";  // 'all', 'active', 'done'
   const STORAGE_KEY = "records";
+  const APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbzmKl7dIzYCJWaCDaT8sYchngFmzjXdq6_3EGEx97OZbG3oq4C012p1KfCniiTZ5Tla/exec";
 
   // DOM 元素
   const form = document.getElementById("shopForm");
@@ -412,15 +413,70 @@
   const container = document.getElementById("cardsContainer");
   const statsSpan = document.getElementById("statsInfo");
 
-  // ======================= 核心函式 (依 contract) =======================
+  // ======================= Google Sheet 連線函式 =======================
   
-  /** loadData(): 從 localStorage 載入資料，初始化 records 陣列 */
-  function loadData() {
+  /** 將 Sheet 回傳的「中文欄位」轉為前端標準格式 */
+  function normalizeRecord(record) {
+    return {
+      id: record["攤位編號"] || record["id"] || "",
+      createdAt: record["建立時間"] || record["createdAt"] || new Date().toISOString(),
+      status: record["營業狀態"] || record["status"] || "active",
+      shopName: record["店鋪名稱"] || record["shopName"] || "",
+      location: record["校園位置"] || record["location"] || "",
+      foodInfo: record["招牌美食與價格"] || record["foodInfo"] || ""
+    };
+  }
+
+  /** 同步資料到 Google Sheet (POST) */
+  async function syncToSheet(payload) {
+    try {
+      const response = await fetch(APPS_SCRIPT_URL, {
+        method: "POST",
+        mode: "no-cors", // 因為 Apps Script 未設定 CORS，使用 no-cors 可避免錯誤，但無法讀取回應
+        headers: { "Content-Type": "text/plain" },
+        body: JSON.stringify(payload)
+      });
+      // 由於 no-cors 模式下 response 為 opaque，無法讀取 ok 狀態，但請求仍會送出
+      console.log("Sync to sheet (no-cors mode):", payload.action);
+    } catch (err) {
+      console.warn("Sync to sheet failed:", err);
+    }
+  }
+
+  /** 從 Google Sheet 讀取所有記錄 (GET) */
+  async function fetchRecordsFromSheet() {
+    try {
+      const response = await fetch(APPS_SCRIPT_URL);
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const data = await response.json();
+      if (data.ok && Array.isArray(data.records)) {
+        return data.records.map(normalizeRecord);
+      } else {
+        throw new Error(data.error || "Invalid response");
+      }
+    } catch (err) {
+      console.warn("Fetch from sheet failed:", err);
+      return null;
+    }
+  }
+
+  // ======================= 核心函式 (修改同步邏輯) =======================
+  
+  /** loadData(): 從 Google Sheet 讀取，失敗時 fallback 到 localStorage */
+  async function loadData() {
+    // 先嘗試從 Sheet 讀取
+    const sheetRecords = await fetchRecordsFromSheet();
+    if (sheetRecords !== null && sheetRecords.length > 0) {
+      records = sheetRecords;
+      saveData(records); // 同步到 localStorage 作為快取
+      return;
+    }
+    
+    // 若 Sheet 讀取失敗或無資料，改用 localStorage
     const stored = localStorage.getItem(STORAGE_KEY);
     if (stored) {
       try {
         records = JSON.parse(stored);
-        // 確保每筆 record 有必要的欄位 (資料完整性)
         records = records.filter(item => item && typeof item === 'object').map(item => ({
           id: item.id || Date.now() + '-' + Math.random(),
           createdAt: item.createdAt || new Date().toISOString(),
@@ -434,17 +490,16 @@
         records = [];
       }
     } else {
-      // 不加入任何寫死的假資料，維持空陣列
       records = [];
     }
   }
 
-  /** saveData(records): 將整個 records 陣列儲存到 localStorage */
+  /** saveData(records): 將整個 records 陣列儲存到 localStorage (備份) */
   function saveData(recordsArray) {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(recordsArray));
   }
 
-  /** createRecord(formData): 新增一筆 record，回傳新增的完整 record 物件 */
+  /** createRecord(formData): 新增一筆 record，回傳新增的完整 record 物件，同步到 Sheet */
   function createRecord(formData) {
     const newRecord = {
       id: Date.now() + '-' + Math.random().toString(36).substring(2, 10),
@@ -454,31 +509,47 @@
       location: formData.location.trim(),
       foodInfo: formData.foodInfo ? formData.foodInfo.trim() : ""
     };
-    records.unshift(newRecord);   // 最新顯示在上方
+    records.unshift(newRecord);
     saveData(records);
+    
+    // 同步到 Google Sheet
+    syncToSheet({ action: "create", record: newRecord });
+    
     return newRecord;
   }
 
-  /** updateRecord(id, changes): 根據 id 更新特定欄位 (如 status) */
+  /** updateRecord(id, changes): 根據 id 更新特定欄位，並同步到 Sheet */
   function updateRecord(id, changes) {
     const index = records.findIndex(r => r.id === id);
     if (index !== -1) {
       records[index] = { ...records[index], ...changes };
       saveData(records);
+      
+      // 同步到 Google Sheet
+      syncToSheet({ action: "update", id: id, changes: changes });
+      
       return true;
     }
     return false;
   }
 
+  /** 刪除記錄 (本地刪除並同步告知 Sheet 該筆 status 改為 deleted 或無動作，此處僅本地) 
+   *  注意：Sheet API 未實作 delete，故只移除本地與 localStorage
+   */
+  function deleteRecord(id) {
+    records = records.filter(r => r.id !== id);
+    saveData(records);
+    // 可選：可呼叫 syncToSheet 標記刪除，但 sheet 無 delete action，僅做提醒
+    console.log("Record deleted locally, sheet unchanged for id:", id);
+  }
+
   /** renderList(recordsToShow): 根據傳入的資料陣列繪製卡片清單 */
   function renderList(recordsToShow) {
-    // 更新統計數字 (用全部 records 計算)
     const total = records.length;
     const activeCount = records.filter(r => r.status === "active").length;
     const doneCount = records.filter(r => r.status === "done").length;
     statsSpan.innerHTML = `📊 總計 ${total} 攤 ｜ 🟢 營業 ${activeCount} ｜ ⚫ 暫停 ${doneCount}`;
 
-    // 更新 filter 按鈕 active 樣式
     document.querySelectorAll('.filter-btn').forEach(btn => {
       const filterVal = btn.getAttribute('data-filter');
       if (filterVal === currentFilter) {
@@ -488,7 +559,6 @@
       }
     });
 
-    // 空狀態處理
     if (recordsToShow.length === 0) {
       let emptyMsg = "";
       if (currentFilter === "active") emptyMsg = "🌟 目前沒有『營業中』的攤位，新增一間或切換篩選吧！";
@@ -498,7 +568,6 @@
       return;
     }
 
-    // 產生卡片 HTML
     let cardsHtml = "";
     for (let shop of recordsToShow) {
       const isDone = shop.status === "done";
@@ -539,7 +608,6 @@
     }
     container.innerHTML = cardsHtml;
 
-    // 綁定卡片內部按鈕事件
     document.querySelectorAll('.toggle-btn').forEach(btn => {
       btn.addEventListener('click', (e) => {
         e.stopPropagation();
@@ -560,8 +628,7 @@
         e.stopPropagation();
         const id = btn.getAttribute('data-id');
         if (id && confirm("確定要刪除此美食攤位嗎？")) {
-          records = records.filter(r => r.id !== id);
-          saveData(records);
+          deleteRecord(id);
           refreshByCurrentFilter();
         }
       });
@@ -590,7 +657,6 @@
     }
   }
 
-  /** 依據 currentFilter 取得要顯示的 records */
   function getFilteredRecords() {
     if (currentFilter === "active") {
       return records.filter(r => r.status === "active");
@@ -600,13 +666,11 @@
     return [...records];
   }
 
-  /** 刷新畫面 (根據當前篩選條件呼叫 renderList) */
   function refreshByCurrentFilter() {
     const filtered = getFilteredRecords();
     renderList(filtered);
   }
 
-  /** 切換篩選條件並刷新 */
   function setFilter(filter) {
     if (filter === 'all' || filter === 'active' || filter === 'done') {
       currentFilter = filter;
@@ -621,7 +685,6 @@
     const location = locationInput.value;
     const foodInfo = foodInfoInput.value;
 
-    // 必填驗證
     if (!shopName || !shopName.trim()) {
       alert("請填寫店鋪名稱 (必填)");
       return;
@@ -639,13 +702,11 @@
     
     createRecord(formData);
     
-    // 清空表單
     shopNameInput.value = "";
     locationInput.value = "";
     foodInfoInput.value = "";
     shopNameInput.focus();
     
-    // 新增後，若當前篩選不是全部則自動切換到「全部」以便看到新攤位 (符合直覺)
     if (currentFilter !== 'all') {
       setFilter('all');
     } else {
@@ -663,15 +724,14 @@
     });
   }
 
-  function init() {
-    loadData();               // 從 localStorage 讀取 records
-    bindFilterEvents();      // 綁定篩選按鈕
+  async function init() {
+    await loadData();          // 先載入資料 (Sheet 優先)
+    bindFilterEvents();       // 綁定篩選按鈕
     form.addEventListener('submit', handleFormSubmit);
-    currentFilter = "all";   // 預設顯示全部
-    refreshByCurrentFilter(); // 初次渲染
+    currentFilter = "all";
+    refreshByCurrentFilter();
   }
 
-  // 啟動應用
   init();
 </script>
 </body>
